@@ -13,25 +13,50 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 )
 
-type policyState struct {
-	UserAAllowFeedback bool     `json:"userAAllowFeedback"`
-	RepoURL            string   `json:"repoUrl"`
-	SkillFiles         []string `json:"skillFiles"`
-	ScannedTools       []string `json:"scannedTools"`
-	LastScanStatus     string   `json:"lastScanStatus"`
-	LastApplyStatus    string   `json:"lastApplyStatus"`
+type envoyTarget struct {
+	ID         string `json:"id"`
+	Name       string `json:"name"`
+	URL        string `json:"url"`
+	LastStatus string `json:"lastStatus"`
 }
 
-var state = policyState{}
+type policyState struct {
+	UserAAllowFeedback bool          `json:"userAAllowFeedback"`
+	RepoURL            string        `json:"repoUrl"`
+	SkillFiles         []string      `json:"skillFiles"`
+	ScannedTools       []string      `json:"scannedTools"`
+	Targets            []envoyTarget `json:"targets"`
+	LastScanStatus     string        `json:"lastScanStatus"`
+	LastApplyStatus    string        `json:"lastApplyStatus"`
+}
+
+type applyPayload struct {
+	ConfigYAML string `json:"configYaml"`
+}
+
+var (
+	mu    sync.RWMutex
+	state = policyState{
+		Targets: []envoyTarget{{
+			ID:   "local",
+			Name: "Local Envoy (Docker)",
+			URL:  "http://127.0.0.1:18081/adapter/policy/apply",
+		}},
+	}
+)
 
 func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", ui)
 	mux.HandleFunc("/api/state", getState)
 	mux.HandleFunc("/api/scan", scanRepo)
+	mux.HandleFunc("/api/targets", targets)
+	mux.HandleFunc("/api/targets/", deleteTarget)
 	mux.HandleFunc("/api/apply", apply)
+	mux.HandleFunc("/adapter/policy/apply", localAdapterApply)
 
 	addr := ":18081"
 	log.Printf("control plane UI listening at http://127.0.0.1%s", addr)
@@ -44,6 +69,8 @@ func ui(w http.ResponseWriter, _ *http.Request) {
 }
 
 func getState(w http.ResponseWriter, _ *http.Request) {
+	mu.RLock()
+	defer mu.RUnlock()
 	writeJSON(w, state)
 }
 
@@ -52,9 +79,7 @@ func scanRepo(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	var req struct {
-		RepoURL string `json:"repoUrl"`
-	}
+	var req struct{ RepoURL string `json:"repoUrl"` }
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -91,12 +116,69 @@ func scanRepo(w http.ResponseWriter, r *http.Request) {
 	sort.Strings(toolList)
 	sort.Strings(files)
 
+	mu.Lock()
 	state.RepoURL = req.RepoURL
 	state.SkillFiles = files
 	state.ScannedTools = toolList
-	state.LastScanStatus = fmt.Sprintf("scanned %d SKILL.md files from %s/%s@%s", len(files), owner, repo, branch)
+	state.LastScanStatus = fmt.Sprintf("Scanned %d SKILL.md file(s) from %s/%s@%s", len(files), owner, repo, branch)
+	mu.Unlock()
 
-	writeJSON(w, state)
+	getState(w, r)
+}
+
+func targets(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		Name string `json:"name"`
+		URL  string `json:"url"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if strings.TrimSpace(req.Name) == "" || strings.TrimSpace(req.URL) == "" {
+		http.Error(w, "name and url are required", http.StatusBadRequest)
+		return
+	}
+	u, err := url.Parse(req.URL)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		http.Error(w, "invalid target URL", http.StatusBadRequest)
+		return
+	}
+	id := slug(req.Name + "-" + req.URL)
+
+	mu.Lock()
+	state.Targets = append(state.Targets, envoyTarget{ID: id, Name: req.Name, URL: req.URL})
+	mu.Unlock()
+	getState(w, r)
+}
+
+func deleteTarget(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodDelete {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	id := strings.TrimPrefix(r.URL.Path, "/api/targets/")
+	if id == "" {
+		http.Error(w, "missing target id", http.StatusBadRequest)
+		return
+	}
+	mu.Lock()
+	out := make([]envoyTarget, 0, len(state.Targets))
+	for _, t := range state.Targets {
+		if t.ID == id && t.ID == "local" {
+			continue
+		}
+		if t.ID != id {
+			out = append(out, t)
+		}
+	}
+	state.Targets = out
+	mu.Unlock()
+	getState(w, r)
 }
 
 func apply(w http.ResponseWriter, r *http.Request) {
@@ -104,32 +186,76 @@ func apply(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	var req struct {
-		UserAAllowFeedback bool `json:"userAAllowFeedback"`
-	}
+	var req struct{ UserAAllowFeedback bool `json:"userAAllowFeedback"` }
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
+	mu.RLock()
+	tools := append([]string(nil), state.ScannedTools...)
+	targets := append([]envoyTarget(nil), state.Targets...)
+	mu.RUnlock()
+
+	cfg := renderConfig(req.UserAAllowFeedback, tools)
+	payloadBytes, _ := json.Marshal(applyPayload{ConfigYAML: cfg})
+
+	statuses := make([]string, 0, len(targets))
+	updated := make([]envoyTarget, 0, len(targets))
+	for _, t := range targets {
+		st := pushToTarget(t.URL, payloadBytes)
+		t.LastStatus = st
+		updated = append(updated, t)
+		statuses = append(statuses, fmt.Sprintf("%s: %s", t.Name, st))
+	}
+
+	mu.Lock()
+	state.UserAAllowFeedback = req.UserAAllowFeedback
+	state.Targets = updated
+	state.LastApplyStatus = strings.Join(statuses, " | ")
+	mu.Unlock()
+	getState(w, r)
+}
+
+func pushToTarget(targetURL string, payload []byte) string {
+	req, _ := http.NewRequest(http.MethodPost, targetURL, bytes.NewReader(payload))
+	req.Header.Set("content-type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "failed: " + err.Error()
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		var b bytes.Buffer
+		_, _ = b.ReadFrom(resp.Body)
+		return fmt.Sprintf("failed: http %d %s", resp.StatusCode, strings.TrimSpace(b.String()))
+	}
+	return "ok"
+}
+
+func localAdapterApply(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var p applyPayload
+	if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 	cfgPath := "/tmp/aigw-dyn/config.yaml"
 	if err := os.MkdirAll("/tmp/aigw-dyn", 0o755); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	cfg := renderConfig(req.UserAAllowFeedback, state.ScannedTools)
-	if err := os.WriteFile(cfgPath, []byte(cfg), 0o644); err != nil {
+	if err := os.WriteFile(cfgPath, []byte(p.ConfigYAML), 0o644); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-
-	if out, err := run("docker", "rm", "-f", "aigw-mcp-test"); err != nil {
-		if !strings.Contains(out, "No such container") {
-			http.Error(w, fmt.Sprintf("failed to remove old container: %v: %s", err, out), http.StatusInternalServerError)
-			return
-		}
+	if out, err := run("docker", "rm", "-f", "aigw-mcp-test"); err != nil && !strings.Contains(out, "No such container") {
+		http.Error(w, fmt.Sprintf("failed to remove old container: %v: %s", err, out), http.StatusInternalServerError)
+		return
 	}
-
 	out, err := run("docker", "run", "-d",
 		"--name", "aigw-mcp-test",
 		"-p", "1975:1975",
@@ -141,10 +267,7 @@ func apply(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, fmt.Sprintf("failed to start container: %v: %s", err, out), http.StatusInternalServerError)
 		return
 	}
-
-	state.UserAAllowFeedback = req.UserAAllowFeedback
-	state.LastApplyStatus = "applied: " + strings.TrimSpace(out)
-	writeJSON(w, state)
+	writeJSON(w, map[string]string{"status": "ok", "container": strings.TrimSpace(out)})
 }
 
 func run(name string, args ...string) (string, error) {
@@ -178,11 +301,9 @@ func parseGitHubRepo(raw string) (owner, repo string, err error) {
 }
 
 func fetchDefaultBranch(owner, repo string) (string, error) {
-	url := fmt.Sprintf("https://api.github.com/repos/%s/%s", owner, repo)
-	var body struct {
-		DefaultBranch string `json:"default_branch"`
-	}
-	if err := getJSON(url, &body); err != nil {
+	u := fmt.Sprintf("https://api.github.com/repos/%s/%s", owner, repo)
+	var body struct{ DefaultBranch string `json:"default_branch"` }
+	if err := getJSON(u, &body); err != nil {
 		return "", err
 	}
 	if body.DefaultBranch == "" {
@@ -192,14 +313,14 @@ func fetchDefaultBranch(owner, repo string) (string, error) {
 }
 
 func fetchSkillFiles(owner, repo, branch string) ([]string, error) {
-	url := fmt.Sprintf("https://api.github.com/repos/%s/%s/git/trees/%s?recursive=1", owner, repo, branch)
+	u := fmt.Sprintf("https://api.github.com/repos/%s/%s/git/trees/%s?recursive=1", owner, repo, branch)
 	var body struct {
 		Tree []struct {
 			Path string `json:"path"`
 			Type string `json:"type"`
 		} `json:"tree"`
 	}
-	if err := getJSON(url, &body); err != nil {
+	if err := getJSON(u, &body); err != nil {
 		return nil, err
 	}
 	out := []string{}
@@ -226,22 +347,20 @@ func fetchToolsFromSkillFile(owner, repo, branch, path string) ([]string, error)
 	var b bytes.Buffer
 	_, _ = b.ReadFrom(resp.Body)
 	content := b.String()
-
 	r := regexp.MustCompile(`(?m)^\s*-\s*([A-Za-z0-9_\-\.]+)\s*$`)
 	m := r.FindAllStringSubmatch(content, -1)
 	tools := []string{}
 	for _, mm := range m {
 		t := strings.TrimSpace(mm[1])
-		if t == "" {
-			continue
+		if t != "" {
+			tools = append(tools, t)
 		}
-		tools = append(tools, t)
 	}
 	return tools, nil
 }
 
-func getJSON(url string, out any) error {
-	req, _ := http.NewRequest(http.MethodGet, url, nil)
+func getJSON(u string, out any) error {
+	req, _ := http.NewRequest(http.MethodGet, u, nil)
 	req.Header.Set("User-Agent", "aigw-control-plane-ui")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -264,13 +383,22 @@ func pathBase(p string) string {
 	return p[idx+1:]
 }
 
+func slug(s string) string {
+	s = strings.ToLower(s)
+	r := regexp.MustCompile(`[^a-z0-9]+`)
+	s = r.ReplaceAllString(s, "-")
+	s = strings.Trim(s, "-")
+	if s == "" {
+		return "target"
+	}
+	return s
+}
+
 func renderConfig(userAAllowFeedback bool, scannedTools []string) string {
-	// Keep deterministic baseline tools for demo backend.
 	userATools := []string{"search-flight"}
 	if userAAllowFeedback {
 		userATools = append(userATools, "feedback-to-devs")
 	}
-	// If scan discovered exactly these kiwi tool names, keep them in sync.
 	for _, t := range scannedTools {
 		if t == "search-flight" || t == "feedback-to-devs" {
 			if !contains(userATools, t) {
@@ -388,42 +516,106 @@ func contains(arr []string, v string) bool {
 const page = `<!doctype html>
 <html><head><meta charset="utf-8"><title>AIGW Control Plane UI</title>
 <style>
-body{font-family:Arial;margin:20px;max-width:900px}
-.card{border:1px solid #ddd;padding:14px;border-radius:8px;margin-bottom:12px}
+body{font-family:Arial;margin:20px;max-width:1100px}
+.card{border:1px solid #ddd;padding:14px;border-radius:8px;margin-bottom:14px;background:#fff}
 button{padding:7px 10px;margin-right:6px}
-input{padding:6px;width:560px}
+input{padding:6px}
+input[type=text]{width:420px}
 pre{background:#f7f7f7;padding:10px;white-space:pre-wrap}
 code{background:#f0f0f0;padding:2px 4px;border-radius:4px}
+table{width:100%;border-collapse:collapse;margin-top:8px}
+th,td{border:1px solid #ddd;padding:8px;text-align:left}
+th{background:#fafafa}
+.badge{display:inline-block;padding:2px 8px;border-radius:999px;background:#eef}
 </style></head>
 <body>
-<h2>AIGW Control Plane UI (separate repo)</h2>
+<h2>AIGW Control Plane UI</h2>
+
 <div class="card">
   <h3>1) Scan GitHub repo</h3>
-  <input id="repo" value="https://github.com/rakeshnutest/skill-e2e-demo-20260515-060359"/>
+  <input id="repo" type="text" placeholder="https://github.com/org/repo" value="https://github.com/rakeshnutest/skill-e2e-demo-20260515-060359"/>
   <button onclick="scanRepo()">Scan</button>
-  <div><small>Finds <code>SKILL.md</code> files and extracts bullet-list tools.</small></div>
+  <div id="scanStatus" style="margin-top:8px"></div>
+  <table id="skillsTable" style="display:none">
+    <thead><tr><th>SKILL.md file</th><th>Discovered tools</th></tr></thead>
+    <tbody id="skillsBody"></tbody>
+  </table>
 </div>
+
 <div class="card">
-  <h3>2) Apply policy to Envoy</h3>
-  <label><input id="allow" type="checkbox"/> user-a can access <code>kiwi__feedback-to-devs</code></label><br/><br/>
-  <button onclick="apply()">Apply To Envoy</button>
-  <button onclick="loadState()">Refresh State</button>
+  <h3>2) Envoy targets</h3>
+  <div>
+    <input id="targetName" type="text" placeholder="Target name"/>
+    <input id="targetUrl" type="text" placeholder="http://host:port/adapter/policy/apply"/>
+    <button onclick="addTarget()">Add Target</button>
+  </div>
+  <table>
+    <thead><tr><th>Name</th><th>Policy Push URL</th><th>Last status</th><th>Action</th></tr></thead>
+    <tbody id="targetsBody"></tbody>
+  </table>
 </div>
-<pre id="out"></pre>
+
+<div class="card">
+  <h3>3) Apply policy</h3>
+  <label><input id="allow" type="checkbox"/> user-a can access <code>kiwi__feedback-to-devs</code></label><br/><br/>
+  <button onclick="applyPolicy()">Push Policy To All Targets</button>
+  <button onclick="loadState()">Refresh</button>
+</div>
+
+<div class="card">
+  <h3>State</h3>
+  <pre id="out"></pre>
+</div>
+
 <script>
-async function loadState(){
-  const r=await fetch('/api/state');
-  document.getElementById('out').textContent=JSON.stringify(await r.json(),null,2)
+function esc(s){return String(s??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]))}
+async function j(url,opts={}){const r=await fetch(url,Object.assign({headers:{'content-type':'application/json'}},opts));const t=await r.text();if(!r.ok) throw new Error(t);return t?JSON.parse(t):{}}
+
+function render(state){
+  document.getElementById('out').textContent = JSON.stringify(state,null,2)
+  document.getElementById('allow').checked = !!state.userAAllowFeedback
+  document.getElementById('scanStatus').innerHTML = '<span class="badge">'+esc(state.lastScanStatus||'No scan yet')+'</span>'
+
+  const body=document.getElementById('skillsBody')
+  body.innerHTML=''
+  if ((state.skillFiles||[]).length>0){
+    document.getElementById('skillsTable').style.display='table'
+    for(const f of state.skillFiles){
+      const tr=document.createElement('tr')
+      tr.innerHTML='<td>'+esc(f)+'</td><td>'+esc((state.scannedTools||[]).join(', '))+'</td>'
+      body.appendChild(tr)
+    }
+  } else {
+    document.getElementById('skillsTable').style.display='none'
+  }
+
+  const tb=document.getElementById('targetsBody')
+  tb.innerHTML=''
+  for(const t of (state.targets||[])){
+    const tr=document.createElement('tr')
+    tr.innerHTML='<td>'+esc(t.name)+'</td><td><code>'+esc(t.url)+'</code></td><td>'+esc(t.lastStatus||'pending')+'</td>'+
+      '<td>'+(t.id==='local'?'(default)':('<button onclick="delTarget(\''+esc(t.id)+'\')">Remove</button>'))+'</td>'
+    tb.appendChild(tr)
+  }
 }
+
+async function loadState(){ try{ render(await j('/api/state')) }catch(e){ alert(e.message) } }
 async function scanRepo(){
-  const repoUrl=document.getElementById('repo').value;
-  const r=await fetch('/api/scan',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({repoUrl})});
-  document.getElementById('out').textContent=await r.text();
+  try{ const repoUrl=document.getElementById('repo').value; render(await j('/api/scan',{method:'POST',body:JSON.stringify({repoUrl})})) }
+  catch(e){ alert('Scan failed: '+e.message) }
 }
-async function apply(){
-  const allow=document.getElementById('allow').checked;
-  const r=await fetch('/api/apply',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({userAAllowFeedback:allow})});
-  document.getElementById('out').textContent=await r.text();
+async function addTarget(){
+  try{const name=document.getElementById('targetName').value; const url=document.getElementById('targetUrl').value;
+  render(await j('/api/targets',{method:'POST',body:JSON.stringify({name,url})})); document.getElementById('targetName').value=''; document.getElementById('targetUrl').value=''}
+  catch(e){ alert('Add target failed: '+e.message)}
+}
+async function delTarget(id){
+  try{ render(await j('/api/targets/'+encodeURIComponent(id),{method:'DELETE'})) }
+  catch(e){ alert('Remove failed: '+e.message)}
+}
+async function applyPolicy(){
+  try{ const userAAllowFeedback=document.getElementById('allow').checked; render(await j('/api/apply',{method:'POST',body:JSON.stringify({userAAllowFeedback})})) }
+  catch(e){ alert('Apply failed: '+e.message)}
 }
 loadState();
 </script></body></html>`
