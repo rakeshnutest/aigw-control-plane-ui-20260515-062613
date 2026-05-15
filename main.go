@@ -255,6 +255,10 @@ func requireAdmin(w http.ResponseWriter, r *http.Request) (string, bool) {
 
 func (a *App) state(w http.ResponseWriter, r *http.Request) {
 	u, admin := currentUser(r)
+	if u == "" {
+		writeJSON(w, StateResp{CurrentUser: "", IsAdmin: false})
+		return
+	}
 	skills := a.listSkills()
 	resp := StateResp{
 		CurrentUser:      u,
@@ -608,7 +612,7 @@ function esc(s){return String(s??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&l
 async function j(u,o={}){const r=await fetch(u,Object.assign({headers:{'content-type':'application/json'}},o));const t=await r.text();if(!r.ok) throw new Error(t); return t?JSON.parse(t):{}}
 window.__state=null;
 function en(s,user,skill,tool){const all=s.allPolicies||{}; const m=(all[user]||{}); return !!m[skill+'::'+tool]}
-function render(s){window.__state=s; document.getElementById('out').textContent=JSON.stringify(s,null,2); document.getElementById('auth').textContent=(s.isAdmin?'Admin':'User')+': '+(s.currentUser||'not logged in'); document.getElementById('scan').textContent=s.lastScanStatus||'';
+function render(s){window.__state=s; document.getElementById('out').textContent=JSON.stringify(s,null,2); document.getElementById('auth').textContent=(s.isAdmin?'Admin':'User')+': '+(s.currentUser||'not logged in'); if(!s.currentUser){document.getElementById('repos').innerHTML='';document.getElementById('skills').innerHTML='';document.getElementById('targets').innerHTML='';document.getElementById('schedules').innerHTML='';document.getElementById('cons').innerHTML='';document.getElementById('scan').textContent='Login to view details'; return;} document.getElementById('scan').textContent=s.lastScanStatus||'';
 const users=s.users||[]; const sel=document.getElementById('userSel'); const cur=sel.value; sel.innerHTML=''; for(const u of users){const o=document.createElement('option'); o.value=u;o.textContent=u;sel.appendChild(o)}; if(users.includes(cur)) sel.value=cur;
 const rb=document.getElementById('repos'); rb.innerHTML=''; for(const r of (s.repos||[])){const tr=document.createElement('tr'); tr.innerHTML='<td>'+esc(r.url)+'</td><td><code>'+esc(r.namespace)+'</code></td><td>'+(s.isAdmin?('<button onclick="delRepo(\''+esc(r.id)+'\')">Remove</button>'):'-')+'</td>'; rb.appendChild(tr)}
 const sv=sel.value || ''; const root=document.getElementById('skills'); root.innerHTML=''; for(const sk of (s.skills||[])){const d=document.createElement('div'); d.className='skill'; let h='<h4>'+esc(sk.name)+'</h4><small>ns:<code>'+esc(sk.namespace)+'</code> backend:<code>'+esc(sk.backend)+'</code></small>'; for(const t of (sk.tools||[])){const c=en(s,sv,sk.id,t)?'checked':''; h+='<label style="display:block"><input type="checkbox" '+c+' onchange="toggleTool(\''+esc(sv)+'\',\''+esc(sk.id)+'\',\''+esc(t)+'\',this.checked)"/> <code>'+esc(t)+'</code></label>'} d.innerHTML=h; root.appendChild(d)}
@@ -635,7 +639,7 @@ function esc(s){return String(s??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&l
 async function j(u,o={}){const r=await fetch(u,Object.assign({headers:{'content-type':'application/json'}},o));const t=await r.text();if(!r.ok) throw new Error(t); return t?JSON.parse(t):{}}
 window.__s=null;
 function enabled(s,skill,tool){const m=s.currentPolicies||{}; return !!m[skill+'::'+tool]}
-function render(s){window.__s=s; document.getElementById('auth').textContent=(s.currentUser?('User: '+s.currentUser):'not logged in'); const root=document.getElementById('skills'); root.innerHTML=''; for(const sk of (s.skills||[])){const d=document.createElement('div'); d.className='skill'; let h='<h4>'+esc(sk.name)+'</h4><small>ns:<code>'+esc(sk.namespace)+'</code> backend:<code>'+esc(sk.backend)+'</code></small>'; for(const t of (sk.tools||[])){const c=enabled(s,sk.id,t)?'checked':''; h+='<label style="display:block"><input type="checkbox" '+c+' onchange="toggleTool(\''+esc(sk.id)+'\',\''+esc(t)+'\',this.checked)"/> <code>'+esc(t)+'</code></label>'} d.innerHTML=h; root.appendChild(d)} }
+function render(s){window.__s=s; document.getElementById('auth').textContent=(s.currentUser?('User: '+s.currentUser):'not logged in'); const root=document.getElementById('skills'); root.innerHTML=''; if(!s.currentUser){return;} for(const sk of (s.skills||[])){const d=document.createElement('div'); d.className='skill'; let h='<h4>'+esc(sk.name)+'</h4><small>ns:<code>'+esc(sk.namespace)+'</code> backend:<code>'+esc(sk.backend)+'</code></small>'; for(const t of (sk.tools||[])){const c=enabled(s,sk.id,t)?'checked':''; h+='<label style="display:block"><input type="checkbox" '+c+' onchange="toggleTool(\''+esc(sk.id)+'\',\''+esc(t)+'\',this.checked)"/> <code>'+esc(t)+'</code></label>'} d.innerHTML=h; root.appendChild(d)} }
 async function load(){ try{render(await j('/api/state'))}catch(e){alert(e.message)} }
 async function login(){ try{await j('/api/login',{method:'POST',body:JSON.stringify({username:document.getElementById('u').value,password:document.getElementById('p').value})}); await load()}catch(e){alert('login failed: '+e.message)} }
 async function logout(){ try{await j('/api/logout',{method:'POST',body:'{}'}); await load()}catch(e){alert(e.message)} }
