@@ -73,10 +73,62 @@ var (
 	}
 )
 
+
+func isAdmin(r *http.Request) bool {
+	c, err := r.Cookie("cp_admin")
+	if err != nil {
+		return false
+	}
+	return c.Value == "1"
+}
+
+func requireAdmin(w http.ResponseWriter, r *http.Request) bool {
+	if isAdmin(r) {
+		return true
+	}
+	http.Error(w, "admin login required", http.StatusUnauthorized)
+	return false
+}
+
+func adminLogin(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		Token string `json:"token"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	adminToken := os.Getenv("CONTROL_PLANE_ADMIN_TOKEN")
+	if adminToken == "" {
+		adminToken = "admin"
+	}
+	if req.Token != adminToken {
+		http.Error(w, "invalid admin token", http.StatusForbidden)
+		return
+	}
+	http.SetCookie(w, &http.Cookie{Name: "cp_admin", Value: "1", Path: "/", HttpOnly: true, SameSite: http.SameSiteLaxMode})
+	writeJSON(w, map[string]any{"ok": true})
+}
+
+func adminLogout(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	http.SetCookie(w, &http.Cookie{Name: "cp_admin", Value: "", Path: "/", MaxAge: -1, HttpOnly: true, SameSite: http.SameSiteLaxMode})
+	writeJSON(w, map[string]any{"ok": true})
+}
+
 func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", ui)
 	mux.HandleFunc("/api/state", getState)
+	mux.HandleFunc("/api/admin/login", adminLogin)
+	mux.HandleFunc("/api/admin/logout", adminLogout)
 
 	mux.HandleFunc("/api/admin/repos", adminRepos)
 	mux.HandleFunc("/api/admin/repos/", adminDeleteRepo)
@@ -100,15 +152,18 @@ func ui(w http.ResponseWriter, _ *http.Request) {
 	_ = tmpl.Execute(w, nil)
 }
 
-func getState(w http.ResponseWriter, _ *http.Request) {
+func getState(w http.ResponseWriter, r *http.Request) {
 	mu.Lock()
 	state.ConsolidatedView = buildConsolidatedView(state.Skills, state.UserPolicies)
 	s := state
 	mu.Unlock()
-	writeJSON(w, s)
+	writeJSON(w, map[string]any{"isAdmin": isAdmin(r), "state": s})
 }
 
 func adminRepos(w http.ResponseWriter, r *http.Request) {
+	if !requireAdmin(w, r) {
+		return
+	}
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -149,6 +204,9 @@ func adminRepos(w http.ResponseWriter, r *http.Request) {
 }
 
 func adminDeleteRepo(w http.ResponseWriter, r *http.Request) {
+	if !requireAdmin(w, r) {
+		return
+	}
 	if r.Method != http.MethodDelete {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -171,6 +229,9 @@ func adminDeleteRepo(w http.ResponseWriter, r *http.Request) {
 }
 
 func adminScan(w http.ResponseWriter, r *http.Request) {
+	if !requireAdmin(w, r) {
+		return
+	}
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -258,6 +319,9 @@ func demoSkillsFromRepos(repos []gitRepo) []discoveredSkill {
 }
 
 func adminTargets(w http.ResponseWriter, r *http.Request) {
+	if !requireAdmin(w, r) {
+		return
+	}
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -287,6 +351,9 @@ func adminTargets(w http.ResponseWriter, r *http.Request) {
 }
 
 func adminDeleteTarget(w http.ResponseWriter, r *http.Request) {
+	if !requireAdmin(w, r) {
+		return
+	}
 	if r.Method != http.MethodDelete {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -343,6 +410,9 @@ func toggleUserTool(w http.ResponseWriter, r *http.Request) {
 }
 
 func apply(w http.ResponseWriter, r *http.Request) {
+	if !requireAdmin(w, r) {
+		return
+	}
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -856,6 +926,15 @@ small{color:#555}
 </style></head>
 <body>
 <h2>AIGW Control Plane UI - Admin</h2>
+<div class="card">
+  <h3>Admin Login</h3>
+  <div class="row">
+    <input id="adminToken" type="password" placeholder="admin token"/>
+    <button onclick="adminLogin()">Login as Admin</button>
+    <button onclick="adminLogout()">Logout</button>
+    <span id="adminStatus"></span>
+  </div>
+</div>
 
 <div class="card">
   <h3>1) Admin Git links (only admin adds repo links)</h3>
@@ -927,8 +1006,10 @@ async function toggleUserTool(skillId,tool,enabled){
   }catch(e){ alert('Toggle failed: '+e.message) }
 }
 
-function renderFromState(state){
-  window.__state = state;
+function renderFromState(resp){
+  const state = resp.state || resp;
+  window.__state = resp;
+  document.getElementById("adminStatus").textContent = (resp.isAdmin?"Admin: logged in":"Admin: not logged in");
   document.getElementById('out').textContent = JSON.stringify(state,null,2)
   document.getElementById('scanStatus').innerHTML = '<span class="badge">'+esc(state.lastScanStatus||'No scan yet')+'</span>'
 
@@ -1009,6 +1090,14 @@ async function delTarget(id){
 async function applyPolicy(){
   try{ renderFromState(await j('/api/admin/apply',{method:'POST',body:'{}'})) }
   catch(e){ alert('Apply failed: '+e.message)}
+}
+async function adminLogin(){
+  try{ const token=document.getElementById('adminToken').value; renderFromState(await j('/api/admin/login',{method:'POST',body:JSON.stringify({token})})); await loadState(); }
+  catch(e){ alert('Login failed: '+e.message)}
+}
+async function adminLogout(){
+  try{ await j('/api/admin/logout',{method:'POST',body:'{}'}); await loadState(); }
+  catch(e){ alert('Logout failed: '+e.message)}
 }
 loadState();
 </script></body></html>`
