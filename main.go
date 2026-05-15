@@ -23,14 +23,26 @@ type envoyTarget struct {
 	LastStatus string `json:"lastStatus"`
 }
 
+type skillTool struct {
+	Name    string `json:"name"`
+	Enabled bool   `json:"enabled"`
+}
+
+type skillEntry struct {
+	ID      string      `json:"id"`
+	Name    string      `json:"name"`
+	Backend string      `json:"backend"`
+	Tools   []skillTool `json:"tools"`
+}
+
 type policyState struct {
-	UserAAllowFeedback bool          `json:"userAAllowFeedback"`
-	RepoURL            string        `json:"repoUrl"`
-	SkillFiles         []string      `json:"skillFiles"`
-	ScannedTools       []string      `json:"scannedTools"`
-	Targets            []envoyTarget `json:"targets"`
-	LastScanStatus     string        `json:"lastScanStatus"`
-	LastApplyStatus    string        `json:"lastApplyStatus"`
+	RepoURL         string        `json:"repoUrl"`
+	SkillFiles      []string      `json:"skillFiles"`
+	ScannedTools    []string      `json:"scannedTools"`
+	Skills          []skillEntry  `json:"skills"`
+	Targets         []envoyTarget `json:"targets"`
+	LastScanStatus  string        `json:"lastScanStatus"`
+	LastApplyStatus string        `json:"lastApplyStatus"`
 }
 
 type applyPayload struct {
@@ -38,15 +50,27 @@ type applyPayload struct {
 }
 
 var (
-	mu    sync.RWMutex
+	mu sync.RWMutex
+
 	state = policyState{
-		Targets: []envoyTarget{{
+		Skills: seededSkills(),
+		Targets: []envoyTarget{ {
 			ID:   "local",
 			Name: "Local Envoy (Docker)",
 			URL:  "http://127.0.0.1:18081/adapter/policy/apply",
 		}},
 	}
 )
+
+func seededSkills() []skillEntry {
+	return []skillEntry{
+		{ID: "skill-kiwi", Name: "Travel Search (Kiwi)", Backend: "kiwi", Tools: []skillTool{{Name: "search-flight", Enabled: true}, {Name: "feedback-to-devs", Enabled: false}}},
+		{ID: "skill-github", Name: "GitHub Pull Requests", Backend: "skill-github", Tools: []skillTool{{Name: "pull_request_read", Enabled: true}, {Name: "pull_request_list", Enabled: true}}},
+		{ID: "skill-jira", Name: "Jira Issues", Backend: "skill-jira", Tools: []skillTool{{Name: "issue_get", Enabled: true}, {Name: "issue_search", Enabled: true}}},
+		{ID: "skill-slack", Name: "Slack Search", Backend: "skill-slack", Tools: []skillTool{{Name: "channel_search", Enabled: true}, {Name: "thread_read", Enabled: false}}},
+		{ID: "skill-wiki", Name: "Internal Wiki", Backend: "skill-wiki", Tools: []skillTool{{Name: "wiki_search", Enabled: true}, {Name: "wiki_read", Enabled: true}}},
+	}
+}
 
 func main() {
 	mux := http.NewServeMux()
@@ -55,6 +79,7 @@ func main() {
 	mux.HandleFunc("/api/scan", scanRepo)
 	mux.HandleFunc("/api/targets", targets)
 	mux.HandleFunc("/api/targets/", deleteTarget)
+	mux.HandleFunc("/api/skills/toggle", toggleTool)
 	mux.HandleFunc("/api/apply", apply)
 	mux.HandleFunc("/adapter/policy/apply", localAdapterApply)
 
@@ -122,7 +147,6 @@ func scanRepo(w http.ResponseWriter, r *http.Request) {
 	state.ScannedTools = toolList
 	state.LastScanStatus = fmt.Sprintf("Scanned %d SKILL.md file(s) from %s/%s@%s", len(files), owner, repo, branch)
 	mu.Unlock()
-
 	getState(w, r)
 }
 
@@ -181,23 +205,48 @@ func deleteTarget(w http.ResponseWriter, r *http.Request) {
 	getState(w, r)
 }
 
+func toggleTool(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		SkillID string `json:"skillId"`
+		Tool    string `json:"tool"`
+		Enabled bool   `json:"enabled"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	for i := range state.Skills {
+		if state.Skills[i].ID != req.SkillID {
+			continue
+		}
+		for j := range state.Skills[i].Tools {
+			if state.Skills[i].Tools[j].Name == req.Tool {
+				state.Skills[i].Tools[j].Enabled = req.Enabled
+				writeJSON(w, state)
+				return
+			}
+		}
+	}
+	http.Error(w, "skill/tool not found", http.StatusNotFound)
+}
+
 func apply(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	var req struct{ UserAAllowFeedback bool `json:"userAAllowFeedback"` }
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-
 	mu.RLock()
-	tools := append([]string(nil), state.ScannedTools...)
+	skills := append([]skillEntry(nil), state.Skills...)
 	targets := append([]envoyTarget(nil), state.Targets...)
 	mu.RUnlock()
 
-	cfg := renderConfig(req.UserAAllowFeedback, tools)
+	cfg := renderConfig(skills)
 	payloadBytes, _ := json.Marshal(applyPayload{ConfigYAML: cfg})
 
 	statuses := make([]string, 0, len(targets))
@@ -210,7 +259,6 @@ func apply(w http.ResponseWriter, r *http.Request) {
 	}
 
 	mu.Lock()
-	state.UserAAllowFeedback = req.UserAAllowFeedback
 	state.Targets = updated
 	state.LastApplyStatus = strings.Join(statuses, " | ")
 	mu.Unlock()
@@ -394,19 +442,19 @@ func slug(s string) string {
 	return s
 }
 
-func renderConfig(userAAllowFeedback bool, scannedTools []string) string {
-	userATools := []string{"search-flight"}
-	if userAAllowFeedback {
-		userATools = append(userATools, "feedback-to-devs")
-	}
-	for _, t := range scannedTools {
-		if t == "search-flight" || t == "feedback-to-devs" {
-			if !contains(userATools, t) {
-				userATools = append(userATools, t)
+func renderConfig(skills []skillEntry) string {
+	userAToolsByBackend := map[string][]string{}
+	for _, sk := range skills {
+		for _, t := range sk.Tools {
+			if t.Enabled {
+				userAToolsByBackend[sk.Backend] = append(userAToolsByBackend[sk.Backend], t.Name)
 			}
 		}
 	}
-	sort.Strings(userATools)
+	for k := range userAToolsByBackend {
+		sort.Strings(userAToolsByBackend[k])
+	}
+	backendNames := []string{"kiwi", "skill-github", "skill-jira", "skill-slack", "skill-wiki"}
 
 	var b strings.Builder
 	b.WriteString(`apiVersion: aigateway.envoyproxy.io/v1beta1
@@ -421,19 +469,28 @@ spec:
       group: gateway.networking.k8s.io
   path: "/mcp"
   backendRefs:
-    - name: kiwi
-      kind: Backend
-      group: gateway.envoyproxy.io
-      path: "/"
-  userToolPolicies:
-    - userId: "user-a"
-      tools:
 `)
-	for _, t := range userATools {
-		b.WriteString("        - backend: \"kiwi\"\n")
-		b.WriteString("          tool: \"")
-		b.WriteString(t)
+	for _, backend := range backendNames {
+		b.WriteString("    - name: \"")
+		b.WriteString(backend)
 		b.WriteString("\"\n")
+		b.WriteString("      kind: Backend\n")
+		b.WriteString("      group: gateway.envoyproxy.io\n")
+		b.WriteString("      path: \"/\"\n")
+	}
+
+	b.WriteString("  userToolPolicies:\n")
+	b.WriteString("    - userId: \"user-a\"\n")
+	b.WriteString("      tools:\n")
+	for backend, tools := range userAToolsByBackend {
+		for _, tool := range tools {
+			b.WriteString("        - backend: \"")
+			b.WriteString(backend)
+			b.WriteString("\"\n")
+			b.WriteString("          tool: \"")
+			b.WriteString(tool)
+			b.WriteString("\"\n")
+		}
 	}
 	b.WriteString(`    - userId: "user-b"
       allowAll: true
@@ -466,6 +523,50 @@ spec:
   validation:
     wellKnownCACertificates: "System"
     hostname: mcp.kiwi.com
+---
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: Backend
+metadata:
+  name: skill-github
+  namespace: default
+spec:
+  endpoints:
+    - fqdn:
+        hostname: mcp.kiwi.com
+        port: 443
+---
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: Backend
+metadata:
+  name: skill-jira
+  namespace: default
+spec:
+  endpoints:
+    - fqdn:
+        hostname: mcp.kiwi.com
+        port: 443
+---
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: Backend
+metadata:
+  name: skill-slack
+  namespace: default
+spec:
+  endpoints:
+    - fqdn:
+        hostname: mcp.kiwi.com
+        port: 443
+---
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: Backend
+metadata:
+  name: skill-wiki
+  namespace: default
+spec:
+  endpoints:
+    - fqdn:
+        hostname: mcp.kiwi.com
+        port: 443
 ---
 apiVersion: gateway.networking.k8s.io/v1
 kind: GatewayClass
@@ -504,29 +605,24 @@ spec:
 	return b.String()
 }
 
-func contains(arr []string, v string) bool {
-	for _, x := range arr {
-		if x == v {
-			return true
-		}
-	}
-	return false
-}
-
 const page = `<!doctype html>
 <html><head><meta charset="utf-8"><title>AIGW Control Plane UI</title>
 <style>
-body{font-family:Arial;margin:20px;max-width:1100px}
+body{font-family:Arial;margin:20px;max-width:1200px;background:#fafafa}
 .card{border:1px solid #ddd;padding:14px;border-radius:8px;margin-bottom:14px;background:#fff}
 button{padding:7px 10px;margin-right:6px}
 input{padding:6px}
-input[type=text]{width:420px}
+input[type=text]{width:460px}
 pre{background:#f7f7f7;padding:10px;white-space:pre-wrap}
 code{background:#f0f0f0;padding:2px 4px;border-radius:4px}
 table{width:100%;border-collapse:collapse;margin-top:8px}
 th,td{border:1px solid #ddd;padding:8px;text-align:left}
 th{background:#fafafa}
 .badge{display:inline-block;padding:2px 8px;border-radius:999px;background:#eef}
+.skills{display:grid;grid-template-columns:repeat(2,minmax(300px,1fr));gap:12px}
+.skill{border:1px solid #e5e5e5;border-radius:8px;padding:10px;background:#fcfcfc}
+.skill h4{margin:0 0 6px 0}
+small{color:#555}
 </style></head>
 <body>
 <h2>AIGW Control Plane UI</h2>
@@ -536,14 +632,15 @@ th{background:#fafafa}
   <input id="repo" type="text" placeholder="https://github.com/org/repo" value="https://github.com/rakeshnutest/skill-e2e-demo-20260515-060359"/>
   <button onclick="scanRepo()">Scan</button>
   <div id="scanStatus" style="margin-top:8px"></div>
-  <table id="skillsTable" style="display:none">
-    <thead><tr><th>SKILL.md file</th><th>Discovered tools</th></tr></thead>
-    <tbody id="skillsBody"></tbody>
-  </table>
 </div>
 
 <div class="card">
-  <h3>2) Envoy targets</h3>
+  <h3>2) Skill catalog (enable/disable tools)</h3>
+  <div class="skills" id="skills"></div>
+</div>
+
+<div class="card">
+  <h3>3) Envoy targets</h3>
   <div>
     <input id="targetName" type="text" placeholder="Target name"/>
     <input id="targetUrl" type="text" placeholder="http://host:port/adapter/policy/apply"/>
@@ -556,8 +653,7 @@ th{background:#fafafa}
 </div>
 
 <div class="card">
-  <h3>3) Apply policy</h3>
-  <label><input id="allow" type="checkbox"/> user-a can access <code>kiwi__feedback-to-devs</code></label><br/><br/>
+  <h3>4) Apply policy</h3>
   <button onclick="applyPolicy()">Push Policy To All Targets</button>
   <button onclick="loadState()">Refresh</button>
 </div>
@@ -571,23 +667,30 @@ th{background:#fafafa}
 function esc(s){return String(s??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]))}
 async function j(url,opts={}){const r=await fetch(url,Object.assign({headers:{'content-type':'application/json'}},opts));const t=await r.text();if(!r.ok) throw new Error(t);return t?JSON.parse(t):{}}
 
+async function toggleTool(skillId,tool,enabled){
+  try{ render(await j('/api/skills/toggle',{method:'POST',body:JSON.stringify({skillId,tool,enabled})})) }
+  catch(e){ alert('Toggle failed: '+e.message) }
+}
+
+function renderSkills(skills){
+  const root=document.getElementById('skills'); root.innerHTML='';
+  for(const sk of (skills||[])){
+    const div=document.createElement('div'); div.className='skill';
+    let html='<h4>'+esc(sk.name)+'</h4><small>backend: <code>'+esc(sk.backend)+'</code></small><div style="margin-top:8px">';
+    for(const t of (sk.tools||[])){
+      const checked=t.enabled?'checked':'';
+      html += '<label style="display:block;margin-bottom:4px"><input type="checkbox" '+checked+' onchange="toggleTool(\''+esc(sk.id)+'\',\''+esc(t.name)+'\',this.checked)"/> <code>'+esc(t.name)+'</code></label>';
+    }
+    html += '</div>';
+    div.innerHTML=html;
+    root.appendChild(div);
+  }
+}
+
 function render(state){
   document.getElementById('out').textContent = JSON.stringify(state,null,2)
-  document.getElementById('allow').checked = !!state.userAAllowFeedback
   document.getElementById('scanStatus').innerHTML = '<span class="badge">'+esc(state.lastScanStatus||'No scan yet')+'</span>'
-
-  const body=document.getElementById('skillsBody')
-  body.innerHTML=''
-  if ((state.skillFiles||[]).length>0){
-    document.getElementById('skillsTable').style.display='table'
-    for(const f of state.skillFiles){
-      const tr=document.createElement('tr')
-      tr.innerHTML='<td>'+esc(f)+'</td><td>'+esc((state.scannedTools||[]).join(', '))+'</td>'
-      body.appendChild(tr)
-    }
-  } else {
-    document.getElementById('skillsTable').style.display='none'
-  }
+  renderSkills(state.skills)
 
   const tb=document.getElementById('targetsBody')
   tb.innerHTML=''
@@ -614,7 +717,7 @@ async function delTarget(id){
   catch(e){ alert('Remove failed: '+e.message)}
 }
 async function applyPolicy(){
-  try{ const userAAllowFeedback=document.getElementById('allow').checked; render(await j('/api/apply',{method:'POST',body:JSON.stringify({userAAllowFeedback})})) }
+  try{ render(await j('/api/apply',{method:'POST',body:'{}'})) }
   catch(e){ alert('Apply failed: '+e.message)}
 }
 loadState();
