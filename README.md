@@ -5,6 +5,7 @@ Separate control-plane demo repo that pushes MCP policy config to a Docker Envoy
 ## What it does
 
 - Hosts a small UI on `:18081`
+- Scans a GitHub repo URL for `SKILL.md` files and extracts tool names
 - Generates `MCPRoute` config with `userToolPolicies`
 - Applies config by rolling `aigw-mcp-test` container with mounted config file
 - Demonstrates dynamic policy updates from UI to gateway runtime
@@ -21,10 +22,12 @@ Separate control-plane demo repo that pushes MCP policy config to a Docker Envoy
 go run .
 ```
 
-Open `http://127.0.0.1:18081` and click **Apply To Envoy**.
+Open `http://127.0.0.1:18081`.
 
-## Verify
+## Verify dynamic policy
 
-Use MCP initialize + tools/list curl flow on `http://127.0.0.1:1975/mcp` with header `x-user-id: user-a`.
-- unchecked toggle: user-a should only see `kiwi__search-flight`
-- checked toggle: user-a should also see `kiwi__feedback-to-devs`
+1. Scan repo URL in UI.
+2. Apply policy with toggle OFF.
+3. Use MCP initialize + `tools/list` with `x-user-id: user-a`; expect only `kiwi__search-flight`.
+4. Apply policy with toggle ON.
+5. Repeat; expect `kiwi__feedback-to-devs` to appear.
